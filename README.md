@@ -106,7 +106,13 @@ implementations in `executor.go`.
 
 Target validation:
 
-- IP targets: non-empty, at most 64 characters, only `0-9 a-f A-F . : /`.
+- IP targets (`block_ip` and `revert_block` alike): non-empty, at most 64
+  characters, only `0-9 a-f A-F . : /`, and then parsed as an address. The target
+  must be a single unicast address, or a CIDR no wider than /24 (IPv4) or /64
+  (IPv6). The unspecified, loopback, link-local, multicast and broadcast ranges,
+  any CIDR that contains one of them, and their IPv4-mapped IPv6 forms are refused.
+  A refusal is a failed result whose error names the reason, for example
+  `invalid target: loopback address`.
 - Usernames: non-empty, at most 64 characters, only `a-z A-Z 0-9 _ . -`.
 
 On a non-Linux host, `block_ip`, `revert_block`, and `disable_user` are recorded

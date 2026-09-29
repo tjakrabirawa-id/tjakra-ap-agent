@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/url"
@@ -52,16 +53,119 @@ func executeCommand(cmd command, enforce, console bool, blockContainer string, l
 	return execResult{"failed", map[string]any{"error": "unknown action"}}
 }
 
-func validIPTarget(t string) bool {
-	if t == "" || len(t) > 64 {
-		return false
+// The narrowest block a single command may cover. A wider CIDR is refused so one bad
+// target cannot DROP a whole network.
+const (
+	minPrefixV4 = 24
+	minPrefixV6 = 64
+)
+
+// neverRange is a range a block target may neither be nor contain. It is held as a
+// 16-byte prefix in the IPv6 address space with IPv4 mapped into ::ffff:0:0/96, so one
+// overlap test covers both families and every IPv4-mapped IPv6 spelling of a range.
+type neverRange struct {
+	ip   net.IP
+	ones int
+	name string
+}
+
+var neverBlock = buildNeverBlock()
+
+func buildNeverBlock() []neverRange {
+	specs := []struct{ cidr, name string }{
+		{"0.0.0.0/32", "unspecified"},
+		{"127.0.0.0/8", "loopback"},
+		{"169.254.0.0/16", "link-local"},
+		{"224.0.0.0/4", "multicast"},
+		{"255.255.255.255/32", "broadcast"},
+		{"::/128", "unspecified"},
+		{"::1/128", "loopback"},
+		{"fe80::/10", "link-local"},
+		{"ff00::/8", "multicast"},
+	}
+	out := make([]neverRange, 0, len(specs))
+	for _, s := range specs {
+		_, n, err := net.ParseCIDR(s.cidr)
+		if err != nil {
+			panic(err)
+		}
+		ip, ones := widenNet(n)
+		out = append(out, neverRange{ip, ones, s.name})
+	}
+	return out
+}
+
+// widenNet returns a network as a 16-byte prefix in the IPv6 address space, with an
+// IPv4 network mapped into ::ffff:0:0/96.
+func widenNet(n *net.IPNet) (net.IP, int) {
+	ones, _ := n.Mask.Size()
+	if len(n.IP) == net.IPv4len {
+		ones += 96
+	}
+	return n.IP.To16(), ones
+}
+
+// prefixesOverlap reports whether two 16-byte prefixes share any address. Prefixes are
+// either nested or disjoint, so comparing the shorter length of the two is enough.
+func prefixesOverlap(a net.IP, aOnes int, b net.IP, bOnes int) bool {
+	m := net.CIDRMask(min(aOnes, bOnes), 128)
+	return a.Mask(m).Equal(b.Mask(m))
+}
+
+// validIPTarget reports whether t is a block target the agent will hand to iptables:
+// one unicast address, or a CIDR no wider than /24 (IPv4) or /64 (IPv6). It refuses the
+// unspecified, loopback, link-local, multicast and broadcast ranges, and any CIDR that
+// contains one of them, including their IPv4-mapped IPv6 spellings. On refusal it
+// returns the reason. The character set check stays first so nothing outside it ever
+// reaches the parser or the argv.
+func validIPTarget(t string) (ok bool, reason string) {
+	if t == "" {
+		return false, "empty"
+	}
+	if len(t) > 64 {
+		return false, "longer than 64 characters"
 	}
 	for _, r := range t {
 		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F') || r == '.' || r == ':' || r == '/') {
-			return false
+			return false, "illegal character"
 		}
 	}
-	return true
+
+	var ip net.IP
+	var ones int
+	if strings.Contains(t, "/") {
+		_, n, err := net.ParseCIDR(t)
+		if err != nil {
+			return false, "not a valid CIDR"
+		}
+		ip, ones = widenNet(n)
+	} else {
+		parsed := net.ParseIP(t)
+		if parsed == nil {
+			return false, "not an IP address"
+		}
+		ip, ones = parsed.To16(), 128
+	}
+
+	// An IPv4-mapped IPv6 address is judged as the IPv4 address it stands for.
+	prefix, floor := ones, minPrefixV6
+	if ip.To4() != nil {
+		prefix, floor = ones-96, minPrefixV4
+	}
+	if prefix < floor {
+		return false, fmt.Sprintf("prefix /%d is broader than the minimum /%d", prefix, floor)
+	}
+
+	for _, r := range neverBlock {
+		if !prefixesOverlap(ip, ones, r.ip, r.ones) {
+			continue
+		}
+		if ones == 128 {
+			return false, r.name + " address"
+		}
+		return false, "range includes " + r.name + " addresses"
+	}
+	return true, ""
 }
 
 func validUsername(u string) bool {
@@ -91,8 +195,9 @@ func iptablesArgs(op, target string) []string {
 // isolation boundary. This is what lets the agent run on the host (full console
 // reach) while a block stays scoped to the monitored container.
 func runFirewall(op, target string, enforce bool, blockContainer string) execResult {
-	if !validIPTarget(target) {
-		return execResult{"failed", map[string]any{"error": "invalid target"}}
+	// One check guards both ops: a signed revert of a refused target is refused too.
+	if ok, reason := validIPTarget(target); !ok {
+		return execResult{"failed", map[string]any{"error": "invalid target: " + reason}}
 	}
 	args := iptablesArgs(op, target)
 	if runtime.GOOS != "linux" {
