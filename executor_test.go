@@ -5,6 +5,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -365,6 +366,102 @@ func TestRunFirewallAcceptsValidTarget(t *testing.T) {
 			if res.Result["op"] != op || res.Result["target"] != target {
 				t.Fatalf("%s %q: result should echo op and target, got %v", op, target, res.Result)
 			}
+		}
+	}
+}
+
+// TestFirewallFamily pins which netfilter front end a target goes to and how it is
+// spelled to it. An IPv6 target needs ip6tables. An IPv4-mapped IPv6 target stands for an
+// IPv4 host, so it goes to iptables in dotted form: ip6tables accepts it and then matches
+// nothing. The prefix is rewritten as a decimal so a leading zero is never read as octal.
+func TestFirewallFamily(t *testing.T) {
+	cases := []struct {
+		target  string
+		bin     string
+		spelled string
+	}{
+		{"203.0.113.9", "iptables", "203.0.113.9"},
+		{"203.0.113.0/24", "iptables", "203.0.113.0/24"},
+		{"203.0.113.0/024", "iptables", "203.0.113.0/24"},
+		{"0.0.0.0/0", "iptables", "0.0.0.0/0"},
+		{"2001:db8::1", "ip6tables", "2001:db8::1"},
+		{"2001:DB8:0:0::5", "ip6tables", "2001:db8::5"},
+		{"2001:db8::1/128", "ip6tables", "2001:db8::1/128"},
+		{"2001:db8::/64", "ip6tables", "2001:db8::/64"},
+		{"2001:db8::/064", "ip6tables", "2001:db8::/64"},
+		{"::1", "ip6tables", "::1"},
+		{"::/0", "ip6tables", "::/0"},
+		{"::ffff:203.0.113.9", "iptables", "203.0.113.9"},
+		{"::ffff:cb00:7109", "iptables", "203.0.113.9"},
+		{"::ffff:203.0.113.9/128", "iptables", "203.0.113.9/32"},
+		{"::ffff:203.0.113.0/120", "iptables", "203.0.113.0/24"},
+		{"::ffff:203.0.113.0/0120", "iptables", "203.0.113.0/24"},
+		{"::ffff:127.0.0.1", "iptables", "127.0.0.1"},
+		// a mapped host with a prefix shorter than 96 is an IPv6 network (::/64 here), not
+		// an IPv4 range, so it must not be turned into a negative IPv4 prefix
+		{"::ffff:203.0.113.9/64", "ip6tables", "::ffff:203.0.113.9/64"},
+	}
+	for _, c := range cases {
+		bin, spelled := firewallFamily(c.target)
+		if bin != c.bin || spelled != c.spelled {
+			t.Fatalf("firewallFamily(%q) = %q, %q, want %q, %q", c.target, bin, spelled, c.bin, c.spelled)
+		}
+	}
+}
+
+// TestFirewallCommandUsesFamilyBinary proves the chosen binary is argv[0] on the direct
+// path and follows "-n" on the nsenter path, for a block and for a revert.
+func TestFirewallCommandUsesFamilyBinary(t *testing.T) {
+	cases := []struct {
+		op        string
+		target    string
+		container string
+		want      string
+	}{
+		{"block", "203.0.113.9", "", "iptables -I INPUT -s 203.0.113.9 -j DROP"},
+		{"block", "2001:db8::1", "", "ip6tables -I INPUT -s 2001:db8::1 -j DROP"},
+		{"revert", "2001:db8::/64", "", "ip6tables -D INPUT -s 2001:db8::/64 -j DROP"},
+		{"block", "::ffff:203.0.113.9", "", "iptables -I INPUT -s 203.0.113.9 -j DROP"},
+		{"block", "203.0.113.9", "some-container", "nsenter -t <pid> -n iptables -I INPUT -s 203.0.113.9 -j DROP"},
+		{"block", "2001:db8::1", "some-container", "nsenter -t <pid> -n ip6tables -I INPUT -s 2001:db8::1 -j DROP"},
+		{"revert", "::ffff:203.0.113.0/120", "some-container", "nsenter -t <pid> -n iptables -D INPUT -s 203.0.113.0/24 -j DROP"},
+	}
+	for _, c := range cases {
+		bin, spelled := firewallFamily(c.target)
+		name, args := firewallCommand(bin, iptablesArgs(c.op, spelled), c.container)
+		if got := strings.Join(append([]string{name}, args...), " "); got != c.want {
+			t.Fatalf("%s %q (container %q): command = %q, want %q", c.op, c.target, c.container, got, c.want)
+		}
+	}
+}
+
+// TestRunFirewallDryRunUsesFamilyBinary checks that runFirewall itself hands the family
+// binary to the command it builds. The preview is only built on Linux, so elsewhere the
+// two pure tests above are what cover the choice.
+func TestRunFirewallDryRunUsesFamilyBinary(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("the dry-run preview is only built on linux")
+	}
+	cases := []struct {
+		op        string
+		target    string
+		container string
+		want      string
+	}{
+		{"block", "203.0.113.9", "", "iptables -I INPUT -s 203.0.113.9 -j DROP"},
+		{"block", "2001:db8::1", "", "ip6tables -I INPUT -s 2001:db8::1 -j DROP"},
+		{"revert", "2001:db8::/64", "", "ip6tables -D INPUT -s 2001:db8::/64 -j DROP"},
+		{"block", "::ffff:203.0.113.9", "", "iptables -I INPUT -s 203.0.113.9 -j DROP"},
+		{"block", "2001:db8::1", "some-container", "nsenter -t <pid> -n ip6tables -I INPUT -s 2001:db8::1 -j DROP"},
+	}
+	for _, c := range cases {
+		res := runFirewall(c.op, c.target, false, c.container)
+		would, _ := res.Result["wouldRun"].([]string)
+		if got := strings.Join(would, " "); res.Status != "done" || got != c.want {
+			t.Fatalf("%s %q (container %q): status %q, wouldRun %q, want %q", c.op, c.target, c.container, res.Status, got, c.want)
+		}
+		if res.Result["target"] != c.target {
+			t.Fatalf("%s %q: result should echo the target as given, got %v", c.op, c.target, res.Result["target"])
 		}
 	}
 }

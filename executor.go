@@ -8,10 +8,12 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"os/exec"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -193,6 +195,40 @@ func validUsername(u string) bool {
 	return true
 }
 
+// firewallFamily picks the netfilter front end for a validated target and the spelling to
+// hand it. An IPv6 target needs ip6tables, which iptables cannot resolve. An IPv4-mapped
+// IPv6 target stands for an IPv4 host, so it goes to iptables in dotted form: ip6tables
+// accepts the mapped spelling and then matches nothing. The prefix is rewritten from its
+// decimal value, so a leading zero is never left for iptables to read as octal.
+func firewallFamily(target string) (bin, spelled string) {
+	host, prefix, cidr := strings.Cut(target, "/")
+	addr, err := netip.ParseAddr(host)
+	if err != nil {
+		return "iptables", target
+	}
+	bits := 0
+	if cidr {
+		if bits, err = strconv.Atoi(prefix); err != nil {
+			return "iptables", target
+		}
+	}
+	// A mapped host under a prefix shorter than 96 bits is an IPv6 network, not an IPv4 range.
+	if addr.Is4In6() && (!cidr || bits >= 96) {
+		addr = addr.Unmap()
+		if cidr {
+			bits -= 96
+		}
+	}
+	bin = "iptables"
+	if addr.Is6() {
+		bin = "ip6tables"
+	}
+	if !cidr {
+		return bin, addr.String()
+	}
+	return bin, fmt.Sprintf("%s/%d", addr, bits)
+}
+
 func iptablesArgs(op, target string) []string {
 	if op == "revert" {
 		return []string{"-D", "INPUT", "-s", target, "-j", "DROP"}
@@ -200,13 +236,13 @@ func iptablesArgs(op, target string) []string {
 	return []string{"-I", "INPUT", "-s", target, "-j", "DROP"}
 }
 
-// runFirewall applies or reverts an iptables DROP for a source IP. When
-// blockContainer is set (a host-run agent that must scope blocks to a target's
-// network namespace), the rule runs inside that container's netns via nsenter, so a
-// DROP lands only in the target and never touches the host netfilter. When it is
-// empty the rule runs in the agent's own netns, correct on a host that is itself the
-// isolation boundary. This is what lets the agent run on the host (full console
-// reach) while a block stays scoped to the monitored container.
+// runFirewall applies or reverts an iptables DROP for a source IP, through ip6tables when
+// the source is IPv6 (see firewallFamily). When blockContainer is set (a host-run agent
+// that must scope blocks to a target's network namespace), the rule runs inside that
+// container's netns via nsenter, so a DROP lands only in the target and never touches
+// the host netfilter. When it is empty the rule runs in the agent's own netns, correct
+// on a host that is itself the isolation boundary. This is what lets the agent run on
+// the host (full console reach) while a block stays scoped to the monitored container.
 func runFirewall(op, target string, enforce bool, blockContainer string) execResult {
 	// A block is judged by policy, a revert by syntax only: a revert just deletes the exact
 	// DROP rule, so a rule an older build installed for a target the policy now refuses
@@ -218,11 +254,12 @@ func runFirewall(op, target string, enforce bool, blockContainer string) execRes
 	} else if ok, reason := validIPTarget(target); !ok {
 		return execResult{"failed", map[string]any{"error": "invalid target: " + reason}}
 	}
-	args := iptablesArgs(op, target)
+	bin, spelled := firewallFamily(target)
+	args := iptablesArgs(op, spelled)
 	if runtime.GOOS != "linux" {
 		return execResult{"done", map[string]any{"note": "recorded on a non-linux host, no firewall change", "op": op, "target": target}}
 	}
-	name, cmdArgs := firewallCommand(args, blockContainer)
+	name, cmdArgs := firewallCommand(bin, args, blockContainer)
 	if !enforce {
 		return execResult{"done", map[string]any{"note": "dry-run: start the agent with -enforce to apply", "op": op, "target": target, "wouldRun": append([]string{name}, cmdArgs...)}}
 	}
@@ -232,7 +269,7 @@ func runFirewall(op, target string, enforce bool, blockContainer string) execRes
 			return execResult{"failed", map[string]any{"error": "could not resolve block container netns: " + err.Error(), "container": blockContainer}}
 		}
 		// Rebuild the args with the freshly resolved pid (it changes on restart).
-		name, cmdArgs = "nsenter", append([]string{"-t", pid, "-n", "iptables"}, args...)
+		name, cmdArgs = "nsenter", append([]string{"-t", pid, "-n", bin}, args...)
 	}
 	out, err := exec.Command(name, cmdArgs...).CombinedOutput()
 	if err != nil {
@@ -241,13 +278,14 @@ func runFirewall(op, target string, enforce bool, blockContainer string) execRes
 	return execResult{"done", map[string]any{"op": op, "target": target, "container": blockContainer, "output": string(out)}}
 }
 
-// firewallCommand builds the command name and args for a dry-run preview. The real
-// run re-resolves the container pid at apply time.
-func firewallCommand(iptablesArgs []string, blockContainer string) (string, []string) {
+// firewallCommand builds the command name and args for a dry-run preview, running bin
+// (iptables or ip6tables) directly or inside the block container's netns. The real run
+// re-resolves the container pid at apply time.
+func firewallCommand(bin string, iptablesArgs []string, blockContainer string) (string, []string) {
 	if blockContainer != "" {
-		return "nsenter", append([]string{"-t", "<pid>", "-n", "iptables"}, iptablesArgs...)
+		return "nsenter", append([]string{"-t", "<pid>", "-n", bin}, iptablesArgs...)
 	}
-	return "iptables", iptablesArgs
+	return bin, iptablesArgs
 }
 
 // containerPid resolves a container's init pid, which is the handle for entering its

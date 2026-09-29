@@ -96,8 +96,8 @@ implementations in `executor.go`.
 
 | Action | Params | Behavior | Gate |
 | --- | --- | --- | --- |
-| `block_ip` | `target`: IP or CIDR | `iptables -I INPUT -s <target> -j DROP` in the agent's network namespace | dry-run unless `-enforce` |
-| `revert_block` | `target`: IP or CIDR | `iptables -D INPUT -s <target> -j DROP` | dry-run unless `-enforce` |
+| `block_ip` | `target`: IP or CIDR | `iptables -I INPUT -s <target> -j DROP` in the agent's network namespace (`ip6tables` for an IPv6 target) | dry-run unless `-enforce` |
+| `revert_block` | `target`: IP or CIDR | `iptables -D INPUT -s <target> -j DROP` (`ip6tables` for an IPv6 target) | dry-run unless `-enforce` |
 | `disable_user` | `target`: username | `usermod -L <target>` | dry-run unless `-enforce` |
 | `isolate_host` | none used | recorded only, not enforced in this build | none |
 | `run_collector` | none | returns `hostname`, `os`, `arch` | none |
@@ -119,6 +119,11 @@ Target validation:
   matching DROP rule, so a rule that an older build installed for a target the
   policy now refuses (a `/16` range, `0.0.0.0/0`, a loopback address) can still be
   lifted.
+- An IPv6 target is enforced with `ip6tables`, which must be installed beside
+  `iptables` (they ship in the same package on most distributions). An IPv4-mapped
+  IPv6 target such as `::ffff:203.0.113.9` stands for an IPv4 host, so it is
+  enforced with `iptables` in dotted form (`203.0.113.9`). The prefix is passed on
+  as a plain decimal number in either case.
 - A refusal is a failed result whose error names the reason, for example
   `invalid target: loopback address`.
 - Usernames: non-empty, at most 64 characters, only `a-z A-Z 0-9 _ . -`.
