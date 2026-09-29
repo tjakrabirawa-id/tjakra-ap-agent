@@ -112,44 +112,52 @@ func prefixesOverlap(a net.IP, aOnes int, b net.IP, bOnes int) bool {
 	return a.Mask(m).Equal(b.Mask(m))
 }
 
-// validIPTarget reports whether t is a block target the agent will hand to iptables:
-// one unicast address, or a CIDR no wider than /24 (IPv4) or /64 (IPv6). It refuses the
-// unspecified, loopback, link-local, multicast and broadcast ranges, and any CIDR that
-// contains one of them, including their IPv4-mapped IPv6 spellings. A CIDR prefix with
-// a leading zero is refused because iptables reads it as octal. On refusal it returns
-// the reason. The character set check stays first so nothing outside it ever reaches
-// the parser or the argv.
-func validIPTarget(t string) (ok bool, reason string) {
+// parseIPTarget is the syntax step: it reports whether t is a well-formed address or CIDR
+// and returns it as a 16-byte prefix (IPv4 mapped into ::ffff:0:0/96), or the reason it is
+// not. It checks the character set first so nothing outside it ever reaches the parser or
+// the argv, then refuses a CIDR prefix with a leading zero, which iptables reads as octal.
+// It applies no policy, so a revert can lift a rule the policy would no longer let in.
+func parseIPTarget(t string) (ip net.IP, ones int, reason string) {
 	if t == "" {
-		return false, "empty"
+		return nil, 0, "empty"
 	}
 	if len(t) > 64 {
-		return false, "longer than 64 characters"
+		return nil, 0, "longer than 64 characters"
 	}
 	for _, r := range t {
 		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F') || r == '.' || r == ':' || r == '/') {
-			return false, "illegal character"
+			return nil, 0, "illegal character"
 		}
 	}
 
-	var ip net.IP
-	var ones int
 	if i := strings.IndexByte(t, '/'); i >= 0 {
 		// iptables reads the prefix in base 0, so a leading zero is octal: /024 installs /20.
 		if p := t[i+1:]; len(p) > 1 && p[0] == '0' {
-			return false, "prefix has a leading zero"
+			return nil, 0, "prefix has a leading zero"
 		}
 		_, n, err := net.ParseCIDR(t)
 		if err != nil {
-			return false, "not a valid CIDR"
+			return nil, 0, "not a valid CIDR"
 		}
 		ip, ones = widenNet(n)
-	} else {
-		parsed := net.ParseIP(t)
-		if parsed == nil {
-			return false, "not an IP address"
-		}
-		ip, ones = parsed.To16(), 128
+		return ip, ones, ""
+	}
+	parsed := net.ParseIP(t)
+	if parsed == nil {
+		return nil, 0, "not an IP address"
+	}
+	return parsed.To16(), 128, ""
+}
+
+// validIPTarget reports whether t is a block target the agent will hand to iptables:
+// one unicast address, or a CIDR no wider than /24 (IPv4) or /64 (IPv6). It refuses the
+// unspecified, loopback, link-local, multicast and broadcast ranges, and any CIDR that
+// contains one of them, including their IPv4-mapped IPv6 spellings. On refusal it
+// returns the reason. The syntax step (parseIPTarget) runs first.
+func validIPTarget(t string) (ok bool, reason string) {
+	ip, ones, reason := parseIPTarget(t)
+	if reason != "" {
+		return false, reason
 	}
 
 	// An IPv4-mapped IPv6 address is judged as the IPv4 address it stands for.
@@ -200,8 +208,14 @@ func iptablesArgs(op, target string) []string {
 // isolation boundary. This is what lets the agent run on the host (full console
 // reach) while a block stays scoped to the monitored container.
 func runFirewall(op, target string, enforce bool, blockContainer string) execResult {
-	// One check guards both ops: a signed revert of a refused target is refused too.
-	if ok, reason := validIPTarget(target); !ok {
+	// A block is judged by policy, a revert by syntax only: a revert just deletes the exact
+	// DROP rule, so a rule an older build installed for a target the policy now refuses
+	// must stay removable.
+	if op == "revert" {
+		if _, _, reason := parseIPTarget(target); reason != "" {
+			return execResult{"failed", map[string]any{"error": "invalid target: " + reason}}
+		}
+	} else if ok, reason := validIPTarget(target); !ok {
 		return execResult{"failed", map[string]any{"error": "invalid target: " + reason}}
 	}
 	args := iptablesArgs(op, target)

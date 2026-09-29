@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -213,10 +214,11 @@ func TestValidIPTarget(t *testing.T) {
 	}
 }
 
-// TestRunFirewallRefusesTarget proves a refused target stops at the check for both ops:
-// the failed result carries the reason and nothing else, so the non-linux note and the
-// dry-run preview (and the enforce path behind them) are never reached. Enforce is left
-// off so a regression here cannot touch a real firewall.
+// TestRunFirewallRefusesTarget proves a block of a refused target stops at the policy
+// check: the failed result carries the reason and nothing else, so the non-linux note and
+// the dry-run preview (and the enforce path behind them) are never reached. A revert is
+// judged by syntax only, which TestRunFirewallRevertLiftsLegacyBlocks covers. Enforce is
+// left off so a regression here cannot touch a real firewall.
 func TestRunFirewallRefusesTarget(t *testing.T) {
 	cases := []struct {
 		target string
@@ -240,21 +242,116 @@ func TestRunFirewallRefusesTarget(t *testing.T) {
 		{"1.2.3.4;ls", "illegal character"},
 		{"", "empty"},
 	}
-	for _, op := range []string{"block", "revert"} {
-		for _, container := range []string{"", "some-container"} {
-			for _, c := range cases {
-				res := runFirewall(op, c.target, false, container)
-				if res.Status != "failed" {
-					t.Fatalf("%s %q (container %q): status = %q, want failed (%v)", op, c.target, container, res.Status, res.Result)
-				}
-				if want := "invalid target: " + c.reason; res.Result["error"] != want {
-					t.Fatalf("%s %q (container %q): error = %v, want %q", op, c.target, container, res.Result["error"], want)
-				}
-				if len(res.Result) != 1 {
-					t.Fatalf("%s %q (container %q): result carries more than the error, so a later path ran: %v", op, c.target, container, res.Result)
-				}
+	for _, container := range []string{"", "some-container"} {
+		for _, c := range cases {
+			res := runFirewall("block", c.target, false, container)
+			if res.Status != "failed" {
+				t.Fatalf("block %q (container %q): status = %q, want failed (%v)", c.target, container, res.Status, res.Result)
+			}
+			if want := "invalid target: " + c.reason; res.Result["error"] != want {
+				t.Fatalf("block %q (container %q): error = %v, want %q", c.target, container, res.Result["error"], want)
+			}
+			if len(res.Result) != 1 {
+				t.Fatalf("block %q (container %q): result carries more than the error, so a later path ran: %v", c.target, container, res.Result)
 			}
 		}
+	}
+}
+
+// TestRunFirewallRevertLiftsLegacyBlocks proves a revert is judged by syntax only. A rule
+// an older build installed for a target the policy now refuses must stay removable, or the
+// DROP would outlive the block record. The same targets are still refused as a block.
+func TestRunFirewallRevertLiftsLegacyBlocks(t *testing.T) {
+	legacy := []string{
+		"10.0.0.0/16", "10.0.0.0/8", "0.0.0.0/0", "0.0.0.0", "127.0.0.1", "169.254.0.1",
+		"169.254.169.254", "224.0.0.1", "255.255.255.255", "::1", "::/0", "fe80::1", "ff02::1",
+		"2001:db8::/32", "::ffff:127.0.0.1",
+	}
+	for _, container := range []string{"", "some-container"} {
+		for _, target := range legacy {
+			blocked := runFirewall("block", target, false, container)
+			if blocked.Status != "failed" {
+				t.Fatalf("block %q (container %q): status = %q, want failed", target, container, blocked.Status)
+			}
+			res := runFirewall("revert", target, false, container)
+			if res.Status != "done" {
+				t.Fatalf("revert %q (container %q): status = %q, want done (%v)", target, container, res.Status, res.Result)
+			}
+			if res.Result["op"] != "revert" || res.Result["target"] != target {
+				t.Fatalf("revert %q (container %q): result should echo op and target, got %v", target, container, res.Result)
+			}
+		}
+	}
+
+	// The syntax step still guards the argv: nothing that is not an address gets through.
+	malformed := []string{
+		"", "ff", "not-an-ip", "1.2.3", "010.0.0.1", "2130706433", "1.2.3.4:80", "1.2.3.4;ls", "-s",
+		"10.0.0.0/33", "10.0.0.0/99", "10.0.0.0/", "10.0.0.0/024", "2001:db8::/064", strings.Repeat("1", 65),
+	}
+	for _, target := range malformed {
+		res := runFirewall("revert", target, false, "")
+		if res.Status != "failed" {
+			t.Fatalf("revert %q: status = %q, want failed (%v)", target, res.Status, res.Result)
+		}
+		if msg, _ := res.Result["error"].(string); !strings.HasPrefix(msg, "invalid target: ") {
+			t.Fatalf("revert %q: error = %v, want an invalid target refusal", target, res.Result["error"])
+		}
+		if len(res.Result) != 1 {
+			t.Fatalf("revert %q: result carries more than the error, so a later path ran: %v", target, res.Result)
+		}
+	}
+}
+
+// TestParseIPTarget covers the syntax step alone. It accepts every well-formed address,
+// including those the block policy refuses, and refuses everything that is not one.
+func TestParseIPTarget(t *testing.T) {
+	cases := []struct {
+		target string
+		reason string // substring of the refusal reason; empty when the syntax is fine
+	}{
+		{"203.0.113.9", ""},
+		{"2001:db8::1", ""},
+		{"203.0.113.0/24", ""},
+		{"::ffff:8.8.8.8", ""},
+		{"127.0.0.1", ""},
+		{"0.0.0.0/0", ""},
+		{"10.0.0.0/8", ""},
+		{"::/0", ""},
+		{"::ffff:127.0.0.1", ""},
+		{"", "empty"},
+		{strings.Repeat("1", 65), "longer than 64 characters"},
+		{"1.2.3.4;ls", "illegal character"},
+		{"1.2.3.4 -j ACCEPT", "illegal character"},
+		{"ff", "not an IP address"},
+		{"010.0.0.1", "not an IP address"},
+		{"1.2.3.4:80", "not an IP address"},
+		{"1.2.3.4/33", "not a valid CIDR"},
+		{"1.2.3.4/24/8", "not a valid CIDR"},
+		{"10.0.0.0/024", "leading zero"},
+		{"2001:db8::/064", "leading zero"},
+	}
+	for _, c := range cases {
+		ip, ones, reason := parseIPTarget(c.target)
+		if c.reason == "" {
+			if reason != "" || ip == nil {
+				t.Fatalf("parseIPTarget(%q) = %v, %d, %q, want a parsed address", c.target, ip, ones, reason)
+			}
+			continue
+		}
+		if !strings.Contains(reason, c.reason) {
+			t.Fatalf("parseIPTarget(%q) reason = %q, want it to contain %q", c.target, reason, c.reason)
+		}
+		if ip != nil {
+			t.Fatalf("parseIPTarget(%q) refused but returned an address %v", c.target, ip)
+		}
+	}
+
+	// The prefix comes back as a 16-byte length, with IPv4 mapped into ::ffff:0:0/96.
+	if ip, ones, _ := parseIPTarget("203.0.113.0/24"); ones != 120 || !ip.Equal(net.ParseIP("203.0.113.0")) {
+		t.Fatalf("parseIPTarget(203.0.113.0/24) = %v, %d, want 203.0.113.0, 120", ip, ones)
+	}
+	if ip, ones, _ := parseIPTarget("2001:db8::1"); ones != 128 || !ip.Equal(net.ParseIP("2001:db8::1")) {
+		t.Fatalf("parseIPTarget(2001:db8::1) = %v, %d, want 2001:db8::1, 128", ip, ones)
 	}
 }
 
