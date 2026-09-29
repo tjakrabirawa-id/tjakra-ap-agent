@@ -104,7 +104,10 @@ implementations in `executor.go`.
 | `run_probe` | `target`: loopback or private http(s) URL (default `http://127.0.0.1`), `paths`: list of request paths | fires benign GET requests whose query strings carry RedTeam attack signatures, so a simulation reaches a target bound to localhost | loopback / RFC1918 only, max 20 paths, 6s per-request timeout |
 | `run_command` | `command`: shell command string | remote console: runs the command through the OS shell and returns combined output | inert unless `-console`; see the note below |
 
-Target validation:
+Target validation. Agent 1.2.0 is the first build with it; 1.1.0 and older only
+check the character set. The agent reports its version on every request and the
+console shows it per host (`v1.2.0`), so that is how to confirm a host has the
+checks below:
 
 - IP targets, `block_ip` and `revert_block` alike (the syntax check): non-empty, at
   most 64 characters, only `0-9 a-f A-F . : /`, and then parsed as an address or
