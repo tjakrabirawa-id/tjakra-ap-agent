@@ -350,4 +350,6 @@ sudo ./install.sh --token <ENROLL_TOKEN> --server https://satria-api.tjakrabiraw
 ```
 
 See `docs/DEPLOYMENT.md` for the full install options, the shared-netns container
-pattern, and verification.
+pattern, and verification. To upgrade a host that is already running, follow its
+"Upgrading" section: re-running `install.sh` rewrites the unit's flags from that
+run's arguments alone.
