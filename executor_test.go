@@ -121,6 +121,19 @@ func TestValidIPTarget(t *testing.T) {
 		{"1.2.3.4/24/8", false, "not a valid CIDR"},
 		{"2001:db8::/129", false, "not a valid CIDR"},
 
+		// iptables reads a prefix with a leading zero as octal, so /024 would install /20
+		{"10.0.0.0/024", false, "leading zero"},
+		{"1.2.3.4/032", false, "leading zero"},
+		{"10.0.0.0/0024", false, "leading zero"},
+		{"0.0.1.0/024", false, "leading zero"},
+		{"255.255.255.192/032", false, "leading zero"},
+		{"10.0.0.0/00", false, "leading zero"},
+		{"10.0.0.0/08", false, "leading zero"},
+		{"10.0.0.0/028", false, "leading zero"},
+		{"2001:db8::/064", false, "leading zero"},
+		{"2001:db8::/0128", false, "leading zero"},
+		{"::ffff:10.0.0.0/0120", false, "leading zero"},
+
 		// the character and length checks still hold
 		{"", false, "empty"},
 		{strings.Repeat("1", 65), false, "longer than 64 characters"},
@@ -222,6 +235,7 @@ func TestRunFirewallRefusesTarget(t *testing.T) {
 		{"ff02::1", "multicast address"},
 		{"255.255.255.255", "broadcast address"},
 		{"224.0.0.0/24", "range includes multicast addresses"},
+		{"10.0.0.0/024", "prefix has a leading zero"},
 		{"ff", "not an IP address"},
 		{"1.2.3.4;ls", "illegal character"},
 		{"", "empty"},

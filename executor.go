@@ -115,9 +115,10 @@ func prefixesOverlap(a net.IP, aOnes int, b net.IP, bOnes int) bool {
 // validIPTarget reports whether t is a block target the agent will hand to iptables:
 // one unicast address, or a CIDR no wider than /24 (IPv4) or /64 (IPv6). It refuses the
 // unspecified, loopback, link-local, multicast and broadcast ranges, and any CIDR that
-// contains one of them, including their IPv4-mapped IPv6 spellings. On refusal it
-// returns the reason. The character set check stays first so nothing outside it ever
-// reaches the parser or the argv.
+// contains one of them, including their IPv4-mapped IPv6 spellings. A CIDR prefix with
+// a leading zero is refused because iptables reads it as octal. On refusal it returns
+// the reason. The character set check stays first so nothing outside it ever reaches
+// the parser or the argv.
 func validIPTarget(t string) (ok bool, reason string) {
 	if t == "" {
 		return false, "empty"
@@ -133,7 +134,11 @@ func validIPTarget(t string) (ok bool, reason string) {
 
 	var ip net.IP
 	var ones int
-	if strings.Contains(t, "/") {
+	if i := strings.IndexByte(t, '/'); i >= 0 {
+		// iptables reads the prefix in base 0, so a leading zero is octal: /024 installs /20.
+		if p := t[i+1:]; len(p) > 1 && p[0] == '0' {
+			return false, "prefix has a leading zero"
+		}
 		_, n, err := net.ParseCIDR(t)
 		if err != nil {
 			return false, "not a valid CIDR"
