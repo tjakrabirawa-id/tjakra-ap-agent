@@ -212,9 +212,18 @@ An upgrade replaces the binary and restarts the agent. The enrollment lives in t
 config file (or the `/data` volume), not in the binary, so it survives. Firewall
 rules the agent installed live in the kernel, so restarting the agent does not lift
 them. Agent 1.2.0 is the first build with target validation: after an upgrade, check
-that the console shows `v1.2.0` or later for the host, and that the startup log
-still reports the mode you intended (enforce rather than dry-run, and the remote
-console only where you meant it).
+that the console shows `v1.2.0` or later for the host once it has polled, and that
+the startup log still matches what you intended. It prints `running in dry-run mode`
+only when `-enforce` is missing, so that line must not appear on a host that should
+enforce, and it prints `remote console enabled` only with `-console`.
+
+Before replacing an agent that runs a build older than 1.2.0, let its active blocks
+reach their TTL (at most 24 h) or revert them from the console, then confirm
+`iptables -S INPUT` and `ip6tables -S INPUT` are clean, run in the namespace the agent
+enforces in: the host's, the block container's for Pattern 3, or the target's for
+Pattern 2. Pattern 0 has nothing to lift, since removing its container discards the
+rules. Anything left is a rule the new agent may not be able to lift: see the
+`revert_block` notes under Target validation in the README.
 
 ### systemd hosts (Pattern 1 and Pattern 3)
 
@@ -228,7 +237,9 @@ sudo install -m 0755 <new-binary> /usr/local/bin/tjakra-satria-agent
 sudo systemctl start tjakra-satria-agent
 ```
 
-Stop first: replacing a running binary fails with "text file busy". Build
+Stop first so the agent is not left running the old binary while the file is
+replaced. `install` replaces the file, so it does not fail on a running binary the
+way a plain `cp` over one does ("text file busy"). Build
 `<new-binary>` with `go build -o tjakra-satria-agent .` from the updated checkout,
 or on any machine that has Go with `GOOS=linux GOARCH=amd64`.
 
