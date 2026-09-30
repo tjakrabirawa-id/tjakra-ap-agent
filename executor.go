@@ -259,17 +259,19 @@ func runFirewall(op, target string, enforce bool, blockContainer string) execRes
 	if runtime.GOOS != "linux" {
 		return execResult{"done", map[string]any{"note": "recorded on a non-linux host, no firewall change", "op": op, "target": target}}
 	}
-	name, cmdArgs := firewallCommand(bin, args, blockContainer)
-	if !enforce {
-		return execResult{"done", map[string]any{"note": "dry-run: start the agent with -enforce to apply", "op": op, "target": target, "wouldRun": append([]string{name}, cmdArgs...)}}
-	}
-	if blockContainer != "" {
-		pid, err := containerPid(blockContainer)
+	// The pid is resolved per apply because it changes when the container restarts; the
+	// dry-run preview shows a placeholder.
+	pid := "<pid>"
+	if enforce && blockContainer != "" {
+		p, err := containerPid(blockContainer)
 		if err != nil {
 			return execResult{"failed", map[string]any{"error": "could not resolve block container netns: " + err.Error(), "container": blockContainer}}
 		}
-		// Rebuild the args with the freshly resolved pid (it changes on restart).
-		name, cmdArgs = "nsenter", append([]string{"-t", pid, "-n", bin}, args...)
+		pid = p
+	}
+	name, cmdArgs := firewallCommand(bin, args, blockContainer, pid)
+	if !enforce {
+		return execResult{"done", map[string]any{"note": "dry-run: start the agent with -enforce to apply", "op": op, "target": target, "wouldRun": append([]string{name}, cmdArgs...)}}
 	}
 	out, err := exec.Command(name, cmdArgs...).CombinedOutput()
 	if err != nil {
@@ -278,12 +280,12 @@ func runFirewall(op, target string, enforce bool, blockContainer string) execRes
 	return execResult{"done", map[string]any{"op": op, "target": target, "container": blockContainer, "output": string(out)}}
 }
 
-// firewallCommand builds the command name and args for a dry-run preview, running bin
-// (iptables or ip6tables) directly or inside the block container's netns. The real run
-// re-resolves the container pid at apply time.
-func firewallCommand(bin string, iptablesArgs []string, blockContainer string) (string, []string) {
+// firewallCommand builds the command name and args for both the dry-run preview and the
+// real run, running bin (iptables or ip6tables) directly or inside the block container's
+// netns. pid is the container's init pid; the preview passes a placeholder.
+func firewallCommand(bin string, iptablesArgs []string, blockContainer, pid string) (string, []string) {
 	if blockContainer != "" {
-		return "nsenter", append([]string{"-t", "<pid>", "-n", bin}, iptablesArgs...)
+		return "nsenter", append([]string{"-t", pid, "-n", bin}, iptablesArgs...)
 	}
 	return bin, iptablesArgs
 }

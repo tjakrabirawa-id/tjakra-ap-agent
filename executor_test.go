@@ -99,6 +99,7 @@ func TestValidIPTarget(t *testing.T) {
 		{"2001:db8::1", true, ""},
 		{"2001:DB8::1", true, ""},
 		{"::ffff:8.8.8.8", true, ""}, // mapped form of a plain unicast address
+		{"feff::1", true, ""},        // just below ff00::/8 and above fe80::/10
 
 		// valid CIDRs at or above the minimum prefix
 		{"203.0.113.0/24", true, ""},
@@ -175,9 +176,13 @@ func TestValidIPTarget(t *testing.T) {
 		{"224.0.0.1", false, "multicast address"},
 		{"239.255.255.250", false, "multicast address"},
 		{"ff02::1", false, "multicast address"},
+		{"ff80::1", false, "multicast address"}, // the upper half of ff00::/8
+		{"ffff::1", false, "multicast address"},
 		{"::ffff:224.0.0.1", false, "multicast address"},
 		{"224.0.0.0/24", false, "range includes multicast addresses"},
 		{"ff05::/64", false, "range includes multicast addresses"},
+		{"ff80::/64", false, "range includes multicast addresses"},
+		{"ffff::/64", false, "range includes multicast addresses"},
 
 		// limited broadcast
 		{"255.255.255.255", false, "broadcast address"},
@@ -400,6 +405,10 @@ func TestFirewallFamily(t *testing.T) {
 		// a mapped host with a prefix shorter than 96 is an IPv6 network (::/64 here), not
 		// an IPv4 range, so it must not be turned into a negative IPv4 prefix
 		{"::ffff:203.0.113.9/64", "ip6tables", "::ffff:203.0.113.9/64"},
+		// the boundary: /96 is exactly the mapped block (every IPv4 address), /95 is one bit wider
+		{"::ffff:0:0/96", "iptables", "0.0.0.0/0"},
+		{"::ffff:203.0.113.9/96", "iptables", "203.0.113.9/0"}, // host bits are left to iptables, as for any CIDR
+		{"::ffff:203.0.113.9/95", "ip6tables", "::ffff:203.0.113.9/95"},
 	}
 	for _, c := range cases {
 		bin, spelled := firewallFamily(c.target)
@@ -410,27 +419,35 @@ func TestFirewallFamily(t *testing.T) {
 }
 
 // TestFirewallCommandUsesFamilyBinary proves the chosen binary is argv[0] on the direct
-// path and follows "-n" on the nsenter path, for a block and for a revert.
+// path and follows "-n" on the nsenter path, and that the pid it is given lands after
+// "-t", for a block and for a revert.
 func TestFirewallCommandUsesFamilyBinary(t *testing.T) {
 	cases := []struct {
 		op        string
 		target    string
 		container string
+		pid       string
 		want      string
 	}{
-		{"block", "203.0.113.9", "", "iptables -I INPUT -s 203.0.113.9 -j DROP"},
-		{"block", "2001:db8::1", "", "ip6tables -I INPUT -s 2001:db8::1 -j DROP"},
-		{"revert", "2001:db8::/64", "", "ip6tables -D INPUT -s 2001:db8::/64 -j DROP"},
-		{"block", "::ffff:203.0.113.9", "", "iptables -I INPUT -s 203.0.113.9 -j DROP"},
-		{"block", "203.0.113.9", "some-container", "nsenter -t <pid> -n iptables -I INPUT -s 203.0.113.9 -j DROP"},
-		{"block", "2001:db8::1", "some-container", "nsenter -t <pid> -n ip6tables -I INPUT -s 2001:db8::1 -j DROP"},
-		{"revert", "::ffff:203.0.113.0/120", "some-container", "nsenter -t <pid> -n iptables -D INPUT -s 203.0.113.0/24 -j DROP"},
+		{"block", "203.0.113.9", "", "<pid>", "iptables -I INPUT -s 203.0.113.9 -j DROP"},
+		{"block", "2001:db8::1", "", "<pid>", "ip6tables -I INPUT -s 2001:db8::1 -j DROP"},
+		{"revert", "2001:db8::/64", "", "<pid>", "ip6tables -D INPUT -s 2001:db8::/64 -j DROP"},
+		{"block", "::ffff:203.0.113.9", "", "<pid>", "iptables -I INPUT -s 203.0.113.9 -j DROP"},
+		{"block", "203.0.113.9", "some-container", "<pid>", "nsenter -t <pid> -n iptables -I INPUT -s 203.0.113.9 -j DROP"},
+		{"block", "2001:db8::1", "some-container", "<pid>", "nsenter -t <pid> -n ip6tables -I INPUT -s 2001:db8::1 -j DROP"},
+		{"revert", "::ffff:203.0.113.0/120", "some-container", "<pid>", "nsenter -t <pid> -n iptables -D INPUT -s 203.0.113.0/24 -j DROP"},
+		// a real pid, as the apply path passes it
+		{"block", "203.0.113.9", "some-container", "4242", "nsenter -t 4242 -n iptables -I INPUT -s 203.0.113.9 -j DROP"},
+		{"block", "2001:db8::1", "some-container", "4242", "nsenter -t 4242 -n ip6tables -I INPUT -s 2001:db8::1 -j DROP"},
+		{"revert", "2001:db8::/64", "some-container", "4242", "nsenter -t 4242 -n ip6tables -D INPUT -s 2001:db8::/64 -j DROP"},
+		// no container: the pid is not used
+		{"block", "203.0.113.9", "", "4242", "iptables -I INPUT -s 203.0.113.9 -j DROP"},
 	}
 	for _, c := range cases {
 		bin, spelled := firewallFamily(c.target)
-		name, args := firewallCommand(bin, iptablesArgs(c.op, spelled), c.container)
+		name, args := firewallCommand(bin, iptablesArgs(c.op, spelled), c.container, c.pid)
 		if got := strings.Join(append([]string{name}, args...), " "); got != c.want {
-			t.Fatalf("%s %q (container %q): command = %q, want %q", c.op, c.target, c.container, got, c.want)
+			t.Fatalf("%s %q (container %q, pid %q): command = %q, want %q", c.op, c.target, c.container, c.pid, got, c.want)
 		}
 	}
 }
@@ -463,5 +480,148 @@ func TestRunFirewallDryRunUsesFamilyBinary(t *testing.T) {
 		if res.Result["target"] != c.target {
 			t.Fatalf("%s %q: result should echo the target as given, got %v", c.op, c.target, res.Result["target"])
 		}
+	}
+}
+
+// execFirewall runs a firewall action through executeCommand, the dispatch that chooses the
+// block policy or the syntax-only revert. Enforce is off, so it never touches a firewall.
+func execFirewall(action, target string) execResult {
+	params, _ := json.Marshal(map[string]any{"target": target})
+	return executeCommand(command{Action: action, Params: params}, false, false, "", nil)
+}
+
+// TestExecuteCommandBlockPolicy pins the action-to-check wiring. runFirewall takes the op as
+// a string, so swapping the two calls in executeCommand would leave every runFirewall test
+// green while block_ip accepted loopback and 0.0.0.0/0.
+func TestExecuteCommandBlockPolicy(t *testing.T) {
+	for _, target := range []string{"127.0.0.1", "0.0.0.0/0", "10.0.0.0/024", "::1", "169.254.169.254"} {
+		res := execFirewall("block_ip", target)
+		if res.Status != "failed" {
+			t.Fatalf("block_ip %q: status = %q, want failed (%v)", target, res.Status, res.Result)
+		}
+		if msg, _ := res.Result["error"].(string); !strings.HasPrefix(msg, "invalid target: ") {
+			t.Fatalf("block_ip %q: error = %v, want an invalid target refusal", target, res.Result["error"])
+		}
+	}
+
+	// A revert is judged by syntax only: a canonical target the policy refuses is still lifted.
+	for _, target := range []string{"127.0.0.1", "0.0.0.0/0", "10.0.0.0/16", "::1", "169.254.169.254", "ff02::1"} {
+		res := execFirewall("revert_block", target)
+		if res.Status != "done" {
+			t.Fatalf("revert_block %q: status = %q, want done (%v)", target, res.Status, res.Result)
+		}
+		if res.Result["op"] != "revert" || res.Result["target"] != target {
+			t.Fatalf("revert_block %q: result should echo op and target, got %v", target, res.Result)
+		}
+	}
+
+	// A valid target passes both actions, and each reports the op it ran.
+	for action, op := range map[string]string{"block_ip": "block", "revert_block": "revert"} {
+		res := execFirewall(action, "203.0.113.9")
+		if res.Status != "done" || res.Result["op"] != op {
+			t.Fatalf("%s 203.0.113.9: status %q, result %v, want done with op %q", action, res.Status, res.Result, op)
+		}
+	}
+
+	// The syntax step still guards a revert.
+	res := execFirewall("revert_block", "1.2.3.4;ls")
+	if res.Status != "failed" || res.Result["error"] != "invalid target: illegal character" {
+		t.Fatalf("revert_block 1.2.3.4;ls: status %q, result %v, want an illegal character refusal", res.Status, res.Result)
+	}
+
+	if res := execFirewall("no_such_action", "203.0.113.9"); res.Status != "failed" || res.Result["error"] != "unknown action" {
+		t.Fatalf("unknown action: status %q, result %v, want failed", res.Status, res.Result)
+	}
+}
+
+// TestRunFirewallRecordsOnNonLinux pins the note a non-linux host answers with.
+func TestRunFirewallRecordsOnNonLinux(t *testing.T) {
+	if runtime.GOOS == "linux" {
+		t.Skip("a linux host builds the command")
+	}
+	res := runFirewall("block", "203.0.113.9", true, "some-container")
+	if res.Status != "done" || res.Result["note"] != "recorded on a non-linux host, no firewall change" {
+		t.Fatalf("status %q, result %v, want done with the non-linux note", res.Status, res.Result)
+	}
+	if _, ran := res.Result["wouldRun"]; ran {
+		t.Fatalf("a non-linux host must not build a command, got %v", res.Result)
+	}
+}
+
+// fakeFirewallTools puts stand-ins for docker, nsenter, iptables and ip6tables alone on PATH,
+// so the enforce path runs for real without a firewall behind it. Each one appends its name
+// and argv to the returned log; docker prints dockerOut, the pid `docker inspect` would.
+func fakeFirewallTools(t *testing.T, dockerOut string) (logPath string) {
+	t.Helper()
+	dir := t.TempDir()
+	logPath = filepath.Join(dir, "calls.log")
+	for _, name := range []string{"docker", "nsenter", "iptables", "ip6tables"} {
+		script := "#!/bin/sh\necho \"" + name + " $*\" >> '" + logPath + "'\n"
+		if name == "docker" {
+			script += "echo '" + dockerOut + "'\n"
+		}
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(script), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("PATH", dir)
+	return logPath
+}
+
+func readCalls(t *testing.T, logPath string) []string {
+	t.Helper()
+	raw, err := os.ReadFile(logPath)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	return strings.Split(strings.TrimSpace(string(raw)), "\n")
+}
+
+// TestRunFirewallEnforceRunsFamilyBinary drives the real apply path against stand-in tools
+// and pins the argv it executes: the family binary, the freshly resolved pid, the container
+// key in the result, and that a container that will not resolve runs nothing.
+func TestRunFirewallEnforceRunsFamilyBinary(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("the apply path is only built on linux")
+	}
+	const inspect = "docker inspect -f {{.State.Pid}} victim"
+	cases := []struct {
+		op        string
+		target    string
+		container string
+		want      []string
+	}{
+		{"block", "2001:db8::1", "victim", []string{inspect, "nsenter -t 4242 -n ip6tables -I INPUT -s 2001:db8::1 -j DROP"}},
+		{"block", "203.0.113.9", "victim", []string{inspect, "nsenter -t 4242 -n iptables -I INPUT -s 203.0.113.9 -j DROP"}},
+		{"revert", "::ffff:203.0.113.0/120", "victim", []string{inspect, "nsenter -t 4242 -n iptables -D INPUT -s 203.0.113.0/24 -j DROP"}},
+		{"block", "2001:db8::1", "", []string{"ip6tables -I INPUT -s 2001:db8::1 -j DROP"}},
+		{"revert", "203.0.113.9", "", []string{"iptables -D INPUT -s 203.0.113.9 -j DROP"}},
+	}
+	for _, c := range cases {
+		logPath := fakeFirewallTools(t, "4242")
+		res := runFirewall(c.op, c.target, true, c.container)
+		if res.Status != "done" {
+			t.Fatalf("%s %q (container %q): status = %q, want done (%v)", c.op, c.target, c.container, res.Status, res.Result)
+		}
+		if res.Result["container"] != c.container || res.Result["op"] != c.op || res.Result["target"] != c.target {
+			t.Fatalf("%s %q (container %q): result should carry op, target and container, got %v", c.op, c.target, c.container, res.Result)
+		}
+		if got := readCalls(t, logPath); strings.Join(got, "\n") != strings.Join(c.want, "\n") {
+			t.Fatalf("%s %q (container %q): ran %q, want %q", c.op, c.target, c.container, got, c.want)
+		}
+	}
+
+	// A container that is not running has no netns to enter: nothing is executed.
+	logPath := fakeFirewallTools(t, "0")
+	res := runFirewall("block", "203.0.113.9", true, "victim")
+	msg, _ := res.Result["error"].(string)
+	if res.Status != "failed" || !strings.HasPrefix(msg, "could not resolve block container netns: ") || res.Result["container"] != "victim" {
+		t.Fatalf("stopped container: status %q, result %v, want a failed netns resolution", res.Status, res.Result)
+	}
+	if got := readCalls(t, logPath); len(got) != 1 || got[0] != inspect {
+		t.Fatalf("stopped container: ran %q, want only the inspect", got)
 	}
 }
