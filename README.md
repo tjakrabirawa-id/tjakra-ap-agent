@@ -96,17 +96,53 @@ implementations in `executor.go`.
 
 | Action | Params | Behavior | Gate |
 | --- | --- | --- | --- |
-| `block_ip` | `target`: IP or CIDR | `iptables -I INPUT -s <target> -j DROP` in the agent's network namespace | dry-run unless `-enforce` |
-| `revert_block` | `target`: IP or CIDR | `iptables -D INPUT -s <target> -j DROP` | dry-run unless `-enforce` |
+| `block_ip` | `target`: IP or CIDR | `iptables -I INPUT -s <target> -j DROP` in the agent's network namespace (`ip6tables` for an IPv6 target) | dry-run unless `-enforce` |
+| `revert_block` | `target`: IP or CIDR | `iptables -D INPUT -s <target> -j DROP` (`ip6tables` for an IPv6 target) | dry-run unless `-enforce` |
 | `disable_user` | `target`: username | `usermod -L <target>` | dry-run unless `-enforce` |
 | `isolate_host` | none used | recorded only, not enforced in this build | none |
 | `run_collector` | none | returns `hostname`, `os`, `arch` | none |
 | `run_probe` | `target`: loopback or private http(s) URL (default `http://127.0.0.1`), `paths`: list of request paths | fires benign GET requests whose query strings carry RedTeam attack signatures, so a simulation reaches a target bound to localhost | loopback / RFC1918 only, max 20 paths, 6s per-request timeout |
 | `run_command` | `command`: shell command string | remote console: runs the command through the OS shell and returns combined output | inert unless `-console`; see the note below |
 
-Target validation:
+Target validation. Agent 1.2.0 is the first build with it; 1.1.0 and older only
+check the character set. The agent reports its version on every poll, result and
+log-ship request (not on enroll), and the console shows it per host (`v1.2.0`)
+once the agent has polled, so that is how to confirm a host has the checks below:
 
-- IP targets: non-empty, at most 64 characters, only `0-9 a-f A-F . : /`.
+- IP targets, `block_ip` and `revert_block` alike (the syntax check): non-empty, at
+  most 64 characters, only `0-9 a-f A-F . : /`, and then parsed as an address or
+  CIDR. A CIDR prefix must be written without a leading zero: iptables reads `/024`
+  as octal, which is `/20`, so `10.0.0.0/024` is refused rather than installed wider
+  than the check saw. A revert of one is the exception, described below.
+- `block_ip` also applies the block policy. The target must be a single unicast
+  address, or a CIDR no wider than /24 (IPv4) or /64 (IPv6). The unspecified,
+  loopback, link-local, multicast and broadcast ranges, any CIDR that contains one of
+  them, and their IPv4-mapped IPv6 forms are refused.
+- `revert_block` gets the syntax check only. A revert just deletes the exactly
+  matching DROP rule, so a rule that an older build installed for a target the
+  policy now refuses (a `/16` range, `0.0.0.0/0`, a loopback address) can still be
+  lifted.
+- An older build handed the target to iptables as it came, and iptables reads a
+  leading zero as octal (`203.0.113.7/032` installed a `/26`, `010.0.0.1` is
+  `8.0.0.1`). A revert of such a plain dotted IPv4 target, four groups of digits
+  with an optional `/digits` prefix that iptables reads as numbers, is deleted with
+  the same spelling, never rewritten. A block of it is still refused.
+- Other spellings an older build could have installed cannot be lifted by the
+  agent, and the revert fails with `invalid target` or removes nothing: a dotted
+  netmask (`10.0.0.0/255.0.0.0`), a decimal or short IPv4 (`2130706433`,
+  `127.1`), and an IPv6 target with a `/0` prefix (iptables installed it as the IPv4
+  catch-all `-A INPUT -j DROP`). Remove such a rule by hand with
+  `iptables -D INPUT -s <the spelling as sent> -j DROP` (`iptables`, not
+  `ip6tables`, even for the IPv6-shaped `/0`), run in the namespace the agent
+  enforces in (the block container's, through `nsenter`, for Pattern 3).
+  `iptables -S INPUT` shows what was installed.
+- An IPv6 target is enforced with `ip6tables`, which must be installed beside
+  `iptables` (they ship in the same package on most distributions). An IPv4-mapped
+  IPv6 target such as `::ffff:203.0.113.9` stands for an IPv4 host, so it is
+  enforced with `iptables` in dotted form (`203.0.113.9`). The prefix is passed on
+  as a plain decimal number in either case.
+- A refusal is a failed result whose error names the reason, for example
+  `invalid target: loopback address`.
 - Usernames: non-empty, at most 64 characters, only `a-z A-Z 0-9 _ . -`.
 
 On a non-Linux host, `block_ip`, `revert_block`, and `disable_user` are recorded
@@ -328,4 +364,6 @@ sudo ./install.sh --token <ENROLL_TOKEN> --server https://satria-api.tjakrabiraw
 ```
 
 See `docs/DEPLOYMENT.md` for the full install options, the shared-netns container
-pattern, and verification.
+pattern, and verification. To upgrade a host that is already running, follow its
+"Upgrading" section: re-running `install.sh` rewrites the unit's flags from that
+run's arguments alone.

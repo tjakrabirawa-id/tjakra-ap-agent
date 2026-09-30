@@ -57,7 +57,7 @@ func unwrap(body []byte) json.RawMessage {
 // platform observes) which are still calling a hostname due to be retired.
 // Without it a stale agent is indistinguishable from a healthy one, and the
 // only failure signal is silence.
-const agentVersion = "1.1.0"
+const agentVersion = "1.2.0"
 
 func newClient(insecure bool) *http.Client {
 	tr := &http.Transport{}

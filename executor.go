@@ -5,12 +5,15 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"os/exec"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -52,16 +55,132 @@ func executeCommand(cmd command, enforce, console bool, blockContainer string, l
 	return execResult{"failed", map[string]any{"error": "unknown action"}}
 }
 
-func validIPTarget(t string) bool {
-	if t == "" || len(t) > 64 {
-		return false
+// The narrowest block a single command may cover. A wider CIDR is refused so one bad
+// target cannot DROP a whole network.
+const (
+	minPrefixV4 = 24
+	minPrefixV6 = 64
+)
+
+// neverRange is a range a block target may neither be nor contain. It is held as a
+// 16-byte prefix in the IPv6 address space with IPv4 mapped into ::ffff:0:0/96, so one
+// overlap test covers both families and every IPv4-mapped IPv6 spelling of a range.
+type neverRange struct {
+	ip   net.IP
+	ones int
+	name string
+}
+
+var neverBlock = buildNeverBlock()
+
+func buildNeverBlock() []neverRange {
+	specs := []struct{ cidr, name string }{
+		{"0.0.0.0/32", "unspecified"},
+		{"127.0.0.0/8", "loopback"},
+		{"169.254.0.0/16", "link-local"},
+		{"224.0.0.0/4", "multicast"},
+		{"255.255.255.255/32", "broadcast"},
+		{"::/128", "unspecified"},
+		{"::1/128", "loopback"},
+		{"fe80::/10", "link-local"},
+		{"ff00::/8", "multicast"},
+	}
+	out := make([]neverRange, 0, len(specs))
+	for _, s := range specs {
+		_, n, err := net.ParseCIDR(s.cidr)
+		if err != nil {
+			panic(err)
+		}
+		ip, ones := widenNet(n)
+		out = append(out, neverRange{ip, ones, s.name})
+	}
+	return out
+}
+
+// widenNet returns a network as a 16-byte prefix in the IPv6 address space, with an
+// IPv4 network mapped into ::ffff:0:0/96.
+func widenNet(n *net.IPNet) (net.IP, int) {
+	ones, _ := n.Mask.Size()
+	if len(n.IP) == net.IPv4len {
+		ones += 96
+	}
+	return n.IP.To16(), ones
+}
+
+// prefixesOverlap reports whether two 16-byte prefixes share any address. Prefixes are
+// either nested or disjoint, so comparing the shorter length of the two is enough.
+func prefixesOverlap(a net.IP, aOnes int, b net.IP, bOnes int) bool {
+	m := net.CIDRMask(min(aOnes, bOnes), 128)
+	return a.Mask(m).Equal(b.Mask(m))
+}
+
+// parseIPTarget is the syntax step: it reports whether t is a well-formed address or CIDR
+// and returns it as a 16-byte prefix (IPv4 mapped into ::ffff:0:0/96), or the reason it is
+// not. It checks the character set first so nothing outside it ever reaches the parser or
+// the argv, then refuses a CIDR prefix with a leading zero, which iptables reads as octal.
+// It applies no policy, so a revert can lift a rule the policy would no longer let in.
+func parseIPTarget(t string) (ip net.IP, ones int, reason string) {
+	if t == "" {
+		return nil, 0, "empty"
+	}
+	if len(t) > 64 {
+		return nil, 0, "longer than 64 characters"
 	}
 	for _, r := range t {
 		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F') || r == '.' || r == ':' || r == '/') {
-			return false
+			return nil, 0, "illegal character"
 		}
 	}
-	return true
+
+	if i := strings.IndexByte(t, '/'); i >= 0 {
+		// iptables reads the prefix in base 0, so a leading zero is octal: /024 installs /20.
+		if p := t[i+1:]; len(p) > 1 && p[0] == '0' {
+			return nil, 0, "prefix has a leading zero"
+		}
+		_, n, err := net.ParseCIDR(t)
+		if err != nil {
+			return nil, 0, "not a valid CIDR"
+		}
+		ip, ones = widenNet(n)
+		return ip, ones, ""
+	}
+	parsed := net.ParseIP(t)
+	if parsed == nil {
+		return nil, 0, "not an IP address"
+	}
+	return parsed.To16(), 128, ""
+}
+
+// validIPTarget reports whether t is a block target the agent will hand to iptables:
+// one unicast address, or a CIDR no wider than /24 (IPv4) or /64 (IPv6). It refuses the
+// unspecified, loopback, link-local, multicast and broadcast ranges, and any CIDR that
+// contains one of them, including their IPv4-mapped IPv6 spellings. On refusal it
+// returns the reason. The syntax step (parseIPTarget) runs first.
+func validIPTarget(t string) (ok bool, reason string) {
+	ip, ones, reason := parseIPTarget(t)
+	if reason != "" {
+		return false, reason
+	}
+
+	// An IPv4-mapped IPv6 address is judged as the IPv4 address it stands for.
+	prefix, floor := ones, minPrefixV6
+	if ip.To4() != nil {
+		prefix, floor = ones-96, minPrefixV4
+	}
+	if prefix < floor {
+		return false, fmt.Sprintf("prefix /%d is broader than the minimum /%d", prefix, floor)
+	}
+
+	for _, r := range neverBlock {
+		if !prefixesOverlap(ip, ones, r.ip, r.ones) {
+			continue
+		}
+		if ones == 128 {
+			return false, r.name + " address"
+		}
+		return false, "range includes " + r.name + " addresses"
+	}
+	return true, ""
 }
 
 func validUsername(u string) bool {
@@ -76,6 +195,76 @@ func validUsername(u string) bool {
 	return true
 }
 
+// firewallFamily picks the netfilter front end for a validated target and the spelling to
+// hand it. An IPv6 target needs ip6tables, which iptables cannot resolve. An IPv4-mapped
+// IPv6 target stands for an IPv4 host, so it goes to iptables in dotted form: ip6tables
+// accepts the mapped spelling and then matches nothing. The prefix is rewritten from its
+// decimal value, so a leading zero is never left for iptables to read as octal.
+func firewallFamily(target string) (bin, spelled string) {
+	host, prefix, cidr := strings.Cut(target, "/")
+	addr, err := netip.ParseAddr(host)
+	if err != nil {
+		return "iptables", target
+	}
+	bits := 0
+	if cidr {
+		if bits, err = strconv.Atoi(prefix); err != nil {
+			return "iptables", target
+		}
+	}
+	// A mapped host under a prefix shorter than 96 bits is an IPv6 network, not an IPv4 range.
+	if addr.Is4In6() && (!cidr || bits >= 96) {
+		addr = addr.Unmap()
+		if cidr {
+			bits -= 96
+		}
+	}
+	bin = "iptables"
+	if addr.Is6() {
+		bin = "ip6tables"
+	}
+	if !cidr {
+		return bin, addr.String()
+	}
+	return bin, fmt.Sprintf("%s/%d", addr, bits)
+}
+
+// plainDottedV4 reports whether t is four dot-separated digit groups with an optional
+// /digits prefix that iptables reads as an IPv4 address or network. iptables reads each
+// group and the prefix in base 0, so a leading zero is octal, and it looks up as a host name
+// anything it cannot read that way (a group over 255, a prefix over 32, an 8 or 9 after a
+// leading zero), which would stall the poll loop. This is the shape an older agent could
+// have installed, and being digits and dots only it cannot pass for an option in the argv.
+func plainDottedV4(t string) bool {
+	if len(t) > 64 {
+		return false
+	}
+	host, prefix, cidr := strings.Cut(t, "/")
+	if cidr && !numberInBase0(prefix, 32) {
+		return false
+	}
+	parts := strings.Split(host, ".")
+	if len(parts) != 4 {
+		return false
+	}
+	for _, p := range parts {
+		if !numberInBase0(p, 255) {
+			return false
+		}
+	}
+	return true
+}
+
+// numberInBase0 reports whether s is one or more digits that read, in base 0, as a number
+// no larger than limit.
+func numberInBase0(s string, limit uint64) bool {
+	if s == "" || strings.Trim(s, "0123456789") != "" {
+		return false
+	}
+	n, err := strconv.ParseUint(s, 0, 8)
+	return err == nil && n <= limit
+}
+
 func iptablesArgs(op, target string) []string {
 	if op == "revert" {
 		return []string{"-D", "INPUT", "-s", target, "-j", "DROP"}
@@ -83,32 +272,52 @@ func iptablesArgs(op, target string) []string {
 	return []string{"-I", "INPUT", "-s", target, "-j", "DROP"}
 }
 
-// runFirewall applies or reverts an iptables DROP for a source IP. When
-// blockContainer is set (a host-run agent that must scope blocks to a target's
-// network namespace), the rule runs inside that container's netns via nsenter, so a
-// DROP lands only in the target and never touches the host netfilter. When it is
-// empty the rule runs in the agent's own netns, correct on a host that is itself the
-// isolation boundary. This is what lets the agent run on the host (full console
-// reach) while a block stays scoped to the monitored container.
+// runFirewall applies or reverts an iptables DROP for a source IP, through ip6tables when
+// the source is IPv6 (see firewallFamily). When blockContainer is set (a host-run agent
+// that must scope blocks to a target's network namespace), the rule runs inside that
+// container's netns via nsenter, so a DROP lands only in the target and never touches
+// the host netfilter. When it is empty the rule runs in the agent's own netns, correct
+// on a host that is itself the isolation boundary. This is what lets the agent run on
+// the host (full console reach) while a block stays scoped to the monitored container.
 func runFirewall(op, target string, enforce bool, blockContainer string) execResult {
-	if !validIPTarget(target) {
-		return execResult{"failed", map[string]any{"error": "invalid target"}}
+	// A block is judged by policy, a revert by syntax only: a revert just deletes the exact
+	// DROP rule, so a rule an older build installed for a target the policy now refuses
+	// must stay removable.
+	legacy := false
+	if op == "revert" {
+		if _, _, reason := parseIPTarget(target); reason != "" {
+			// An older agent handed the target to iptables as it came, and iptables reads a leading
+			// zero as octal (/032 installed /26, 010.0.0.1 is 8.0.0.1). Delete with that exact
+			// spelling so the rule stays removable; a block never takes this path.
+			if !plainDottedV4(target) {
+				return execResult{"failed", map[string]any{"error": "invalid target: " + reason}}
+			}
+			legacy = true
+		}
+	} else if ok, reason := validIPTarget(target); !ok {
+		return execResult{"failed", map[string]any{"error": "invalid target: " + reason}}
 	}
-	args := iptablesArgs(op, target)
+	bin, spelled := firewallFamily(target)
+	if legacy {
+		bin, spelled = "iptables", target
+	}
+	args := iptablesArgs(op, spelled)
 	if runtime.GOOS != "linux" {
 		return execResult{"done", map[string]any{"note": "recorded on a non-linux host, no firewall change", "op": op, "target": target}}
 	}
-	name, cmdArgs := firewallCommand(args, blockContainer)
-	if !enforce {
-		return execResult{"done", map[string]any{"note": "dry-run: start the agent with -enforce to apply", "op": op, "target": target, "wouldRun": append([]string{name}, cmdArgs...)}}
-	}
-	if blockContainer != "" {
-		pid, err := containerPid(blockContainer)
+	// The pid is resolved per apply because it changes when the container restarts; the
+	// dry-run preview shows a placeholder.
+	pid := "<pid>"
+	if enforce && blockContainer != "" {
+		p, err := containerPid(blockContainer)
 		if err != nil {
 			return execResult{"failed", map[string]any{"error": "could not resolve block container netns: " + err.Error(), "container": blockContainer}}
 		}
-		// Rebuild the args with the freshly resolved pid (it changes on restart).
-		name, cmdArgs = "nsenter", append([]string{"-t", pid, "-n", "iptables"}, args...)
+		pid = p
+	}
+	name, cmdArgs := firewallCommand(bin, args, blockContainer, pid)
+	if !enforce {
+		return execResult{"done", map[string]any{"note": "dry-run: start the agent with -enforce to apply", "op": op, "target": target, "wouldRun": append([]string{name}, cmdArgs...)}}
 	}
 	out, err := exec.Command(name, cmdArgs...).CombinedOutput()
 	if err != nil {
@@ -117,13 +326,14 @@ func runFirewall(op, target string, enforce bool, blockContainer string) execRes
 	return execResult{"done", map[string]any{"op": op, "target": target, "container": blockContainer, "output": string(out)}}
 }
 
-// firewallCommand builds the command name and args for a dry-run preview. The real
-// run re-resolves the container pid at apply time.
-func firewallCommand(iptablesArgs []string, blockContainer string) (string, []string) {
+// firewallCommand builds the command name and args for both the dry-run preview and the
+// real run, running bin (iptables or ip6tables) directly or inside the block container's
+// netns. pid is the container's init pid; the preview passes a placeholder.
+func firewallCommand(bin string, iptablesArgs []string, blockContainer, pid string) (string, []string) {
 	if blockContainer != "" {
-		return "nsenter", append([]string{"-t", "<pid>", "-n", "iptables"}, iptablesArgs...)
+		return "nsenter", append([]string{"-t", pid, "-n", bin}, iptablesArgs...)
 	}
-	return "iptables", iptablesArgs
+	return bin, iptablesArgs
 }
 
 // containerPid resolves a container's init pid, which is the handle for entering its

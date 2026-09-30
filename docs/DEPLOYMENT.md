@@ -81,7 +81,9 @@ What it does:
 
 Re-running the installer updates the unit and restarts the service. Enroll tokens
 are single-use, so a plain re-run keeps the existing enrollment; pass
-`--re-enroll` with a fresh token to replace it.
+`--re-enroll` with a fresh token to replace it. A re-run also rewrites the unit's
+run flags from that run's arguments alone, so read "Upgrading" below before using
+it to update a host that is already running.
 
 ### The enforce and user tradeoff
 
@@ -203,6 +205,80 @@ Notes:
   that loopback URL so a `run_probe` simulation fires there.
 - Without `-block-container`, blocks run in the host netns, which is correct only on
   a single-purpose host that is itself the isolation boundary.
+
+## Upgrading
+
+An upgrade replaces the binary and restarts the agent. The enrollment lives in the
+config file (or the `/data` volume), not in the binary, so it survives. Firewall
+rules the agent installed live in the kernel, so restarting the agent does not lift
+them. Agent 1.2.0 is the first build with target validation: after an upgrade, check
+that the console shows `v1.2.0` or later for the host once it has polled, and that
+the startup log still matches what you intended. It prints `running in dry-run mode`
+only when `-enforce` is missing, so that line must not appear on a host that should
+enforce, and it prints `remote console enabled` only with `-console`.
+
+Before replacing an agent that runs a build older than 1.2.0, let its active blocks
+reach their TTL (at most 24 h) or revert them from the console, then confirm
+`iptables -S INPUT` and `ip6tables -S INPUT` are clean, run in the namespace the agent
+enforces in: the host's, the block container's for Pattern 3, or the target's for
+Pattern 2. Pattern 0 has nothing to lift, since removing its container discards the
+rules. Anything left is a rule the new agent may not be able to lift: see the
+`revert_block` notes under Target validation in the README.
+
+### systemd hosts (Pattern 1 and Pattern 3)
+
+Stop the unit, install the new binary, start the unit. This keeps the unit file,
+every flag in its `ExecStart` (`-enforce`, `-console`, `-log-file`,
+`-block-container`) and the enrollment:
+
+```sh
+sudo systemctl stop tjakra-satria-agent
+sudo install -m 0755 <new-binary> /usr/local/bin/tjakra-satria-agent
+sudo systemctl start tjakra-satria-agent
+```
+
+Stop first so the agent is not left running the old binary while the file is
+replaced. `install` replaces the file, so it does not fail on a running binary the
+way a plain `cp` over one does ("text file busy"). Build
+`<new-binary>` with `go build -o tjakra-satria-agent .` from the updated checkout,
+or on any machine that has Go with `GOOS=linux GOARCH=amd64`.
+
+### Re-running install.sh
+
+Re-running `install.sh` also installs the new binary, but it rewrites `ExecStart`
+from the arguments of that run alone. It does not read the flags off the existing
+unit, so:
+
+- Repeat every run flag the host had: `--log-file`, `--enforce`, `--console` and
+  `--insecure`. A re-run without `--enforce` leaves the agent in dry-run mode, where
+  a block is reported done with a dry-run note and nothing is applied. A re-run
+  without `--log-file` stops the log shipping.
+- The script still requires `--token` and `--server`. With an enrolled config in
+  place the token is not used or spent, and the existing enrollment is kept.
+- `install.sh` cannot express `-block-container` (nor `-log-allow` or `-poll`). A
+  host started with any of them, such as Pattern 3, must use the systemd path above.
+  Re-running the installer there would overwrite the unit without the flag, and with
+  `-block-container` gone, blocks would land in the host's network namespace instead
+  of the target container's.
+
+### Docker (Pattern 0 and Pattern 2)
+
+Pull (or rebuild) the image, then recreate the container with exactly the options
+the old one had: the same `-e` set, `--cap-add`, `--network` and volumes. The run
+flags come from those options, so any that are left off are dropped.
+
+```sh
+docker pull tjakradev/tjakra-satria-agent:latest
+docker stop patrol-agent && docker rm patrol-agent
+docker run -d --name patrol-agent ...   # the original options
+```
+
+For a locally built image (Pattern 2), run `docker build -t tjakra-satria-agent:latest .`
+from the updated checkout instead of the pull. The named volume (or the mounted
+`agent.json`) carries the enrollment, so the new container needs no token. With
+Pattern 0 the container has its own network namespace and removing it discards the
+rules it installed; with `--network container:<target>` the rules live in the
+target's namespace and stay.
 
 ## RedTeam simulation note (run_probe)
 
