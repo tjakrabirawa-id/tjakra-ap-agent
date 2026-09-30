@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -291,8 +292,12 @@ func TestRunFirewallRevertLiftsLegacyBlocks(t *testing.T) {
 
 	// The syntax step still guards the argv: nothing that is not an address gets through.
 	malformed := []string{
-		"", "ff", "not-an-ip", "1.2.3", "010.0.0.1", "2130706433", "1.2.3.4:80", "1.2.3.4;ls", "-s",
-		"10.0.0.0/33", "10.0.0.0/99", "10.0.0.0/", "10.0.0.0/024", "2001:db8::/064", strings.Repeat("1", 65),
+		"", "ff", "not-an-ip", "1.2.3", "2130706433", "1.2.3.4:80", "1.2.3.4;ls", "-s",
+		"10.0.0.0/33", "10.0.0.0/99", "10.0.0.0/", "2001:db8::/064", strings.Repeat("1", 65),
+		// digits and dots that iptables would look up as a host name, or refuse as a mask
+		"1.2.3.4/0ab", "1.2.3.4/0x1", "1.2.3/024", "1.2.3.4.5", "256.1.1.1", "08.0.0.1", "999.999.999.999",
+		"1.2.3.4/099", "1.2.3.4/041", "1.2.3.4/0245", "1.2.3.4/1000", "cafe", "dead.beef", "1..3.4", ".1.2.3",
+		"10.0.0.0/255.0.0.0", "::ffff:1.2.3.4/0128", "-1.2.3.4", "1.2.3.4/-1",
 	}
 	for _, target := range malformed {
 		res := runFirewall("revert", target, false, "")
@@ -304,6 +309,72 @@ func TestRunFirewallRevertLiftsLegacyBlocks(t *testing.T) {
 		}
 		if len(res.Result) != 1 {
 			t.Fatalf("revert %q: result carries more than the error, so a later path ran: %v", target, res.Result)
+		}
+	}
+}
+
+// legacyOctalSpellings are targets the syntax step refuses but an older agent handed to
+// iptables as they came, and iptables read them in base 0: /032 installed /26, /024
+// installed /20, 010.0.0.1 is 8.0.0.1.
+var legacyOctalSpellings = []string{
+	"203.0.113.7/032", "10.1.2.3/024", "1.2.3.4/00", "10.0.0.0/010", "0.0.0.0/000", "010.0.0.1", "0177.0.0.1",
+	"010.0.0.0/024", "203.0.113.7/0000032", "00.0.0.0/8",
+}
+
+// TestRunFirewallRevertLiftsOctalSpellings proves a revert of a rule an older build installed
+// from a leading-zero spelling deletes with that exact spelling, since iptables reads it as
+// octal and a rewritten /32 would not match the rule. A block of the same spelling is refused.
+func TestRunFirewallRevertLiftsOctalSpellings(t *testing.T) {
+	for _, container := range []string{"", "some-container"} {
+		for _, target := range legacyOctalSpellings {
+			res := runFirewall("revert", target, false, container)
+			if res.Status != "done" {
+				t.Fatalf("revert %q (container %q): status = %q, want done (%v)", target, container, res.Status, res.Result)
+			}
+			if res.Result["op"] != "revert" || res.Result["target"] != target {
+				t.Fatalf("revert %q (container %q): result should echo op and target, got %v", target, container, res.Result)
+			}
+			if runtime.GOOS == "linux" {
+				want := "iptables -D INPUT -s " + target + " -j DROP"
+				if container != "" {
+					want = "nsenter -t <pid> -n " + want
+				}
+				would, _ := res.Result["wouldRun"].([]string)
+				if got := strings.Join(would, " "); got != want {
+					t.Fatalf("revert %q (container %q): wouldRun %q, want %q", target, container, got, want)
+				}
+			}
+
+			blocked := runFirewall("block", target, false, container)
+			msg, _ := blocked.Result["error"].(string)
+			if blocked.Status != "failed" || !strings.HasPrefix(msg, "invalid target: ") || len(blocked.Result) != 1 {
+				t.Fatalf("block %q (container %q): status %q, result %v, want an invalid target refusal", target, container, blocked.Status, blocked.Result)
+			}
+		}
+	}
+}
+
+// TestPlainDottedV4 pins the shape gate: exactly the spellings iptables reads as an IPv4
+// address or network, and none it would look up as a host name.
+func TestPlainDottedV4(t *testing.T) {
+	yes := []string{
+		"1.2.3.4", "0.0.0.0", "255.255.255.255", "010.0.0.1", "0377.0.0.0", "1.2.3.4/32", "1.2.3.4/0", "1.2.3.4/032",
+		"1.2.3.4/040", "1.2.3.4/00", "1.2.3.4/0000032",
+	}
+	no := []string{
+		"", "/", "1.2.3", "1.2.3.4.5", "1..3.4", ".1.2.3", "1.2.3.", "256.1.1.1", "1.2.3.256", "08.1.1.1", "1.2.3.09",
+		"0400.0.0.0", "1.2.3.4/33", "1.2.3.4/041", "1.2.3.4/08", "1.2.3.4/", "1.2.3.4/-1", "1.2.3.4/0x1", "1.2.3.4/1.2",
+		"1.2.3.4/24/8", "0x1.2.3.4", "1.2.3.4a", "cafe", "-1.2.3.4", " 1.2.3.4", "1.2.3.4\n", "2130706433", "::1",
+		"::ffff:1.2.3.4", strings.Repeat("0", 60) + ".1.2.3", // four groups but 66 characters
+	}
+	for _, s := range yes {
+		if !plainDottedV4(s) {
+			t.Fatalf("plainDottedV4(%q) = false, want true", s)
+		}
+	}
+	for _, s := range no {
+		if plainDottedV4(s) {
+			t.Fatalf("plainDottedV4(%q) = true, want false", s)
 		}
 	}
 }
@@ -599,6 +670,9 @@ func TestRunFirewallEnforceRunsFamilyBinary(t *testing.T) {
 		{"revert", "::ffff:203.0.113.0/120", "victim", []string{inspect, "nsenter -t 4242 -n iptables -D INPUT -s 203.0.113.0/24 -j DROP"}},
 		{"block", "2001:db8::1", "", []string{"ip6tables -I INPUT -s 2001:db8::1 -j DROP"}},
 		{"revert", "203.0.113.9", "", []string{"iptables -D INPUT -s 203.0.113.9 -j DROP"}},
+		// an older agent's octal spelling is deleted as it was installed, never rewritten
+		{"revert", "203.0.113.7/032", "", []string{"iptables -D INPUT -s 203.0.113.7/032 -j DROP"}},
+		{"revert", "010.0.0.1", "victim", []string{inspect, "nsenter -t 4242 -n iptables -D INPUT -s 010.0.0.1 -j DROP"}},
 	}
 	for _, c := range cases {
 		logPath := fakeFirewallTools(t, "4242")
@@ -623,5 +697,44 @@ func TestRunFirewallEnforceRunsFamilyBinary(t *testing.T) {
 	}
 	if got := readCalls(t, logPath); len(got) != 1 || got[0] != inspect {
 		t.Fatalf("stopped container: ran %q, want only the inspect", got)
+	}
+}
+
+// TestRunFirewallRevertRoundTripsAgainstIptables installs rules the way an older agent did
+// (the raw target straight to iptables) and reverts them with the current code, then reads
+// the chain back. It changes a real firewall, so it runs only when
+// SATRIA_AGENT_IPTABLES_TEST=1, on linux with NET_ADMIN and an empty INPUT chain, for
+// example a throwaway container from an image that has iptables, run with --network none
+// and --cap-add NET_ADMIN, holding a test binary built by go test -c.
+func TestRunFirewallRevertRoundTripsAgainstIptables(t *testing.T) {
+	if runtime.GOOS != "linux" || os.Getenv("SATRIA_AGENT_IPTABLES_TEST") != "1" {
+		t.Skip("set SATRIA_AGENT_IPTABLES_TEST=1 on linux, in a throwaway network namespace, to run this")
+	}
+	chain := func() string {
+		out, err := exec.Command("iptables", "-S", "INPUT").CombinedOutput()
+		if err != nil {
+			t.Skipf("iptables is not usable here: %v: %s", err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	if got := chain(); got != "-P INPUT ACCEPT" {
+		t.Skipf("the INPUT chain is not empty, so this would touch someone's rules: %q", got)
+	}
+	t.Cleanup(func() { _ = exec.Command("iptables", "-F", "INPUT").Run() })
+
+	targets := append([]string{"10.0.0.0/16", "0.0.0.0/0", "127.0.0.1"}, legacyOctalSpellings...)
+	for _, target := range targets {
+		if out, err := exec.Command("iptables", "-I", "INPUT", "-s", target, "-j", "DROP").CombinedOutput(); err != nil {
+			t.Fatalf("install %q: %v: %s", target, err, out)
+		}
+		if got := chain(); !strings.Contains(got, "DROP") {
+			t.Fatalf("install %q left no rule: %q", target, got)
+		}
+		if res := runFirewall("revert", target, true, ""); res.Status != "done" {
+			t.Fatalf("revert %q: status = %q, want done (%v)", target, res.Status, res.Result)
+		}
+		if got := chain(); got != "-P INPUT ACCEPT" {
+			t.Fatalf("revert %q left a rule behind: %q", target, got)
+		}
 	}
 }

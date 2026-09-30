@@ -229,6 +229,42 @@ func firewallFamily(target string) (bin, spelled string) {
 	return bin, fmt.Sprintf("%s/%d", addr, bits)
 }
 
+// plainDottedV4 reports whether t is four dot-separated digit groups with an optional
+// /digits prefix that iptables reads as an IPv4 address or network. iptables reads each
+// group and the prefix in base 0, so a leading zero is octal, and it looks up as a host name
+// anything it cannot read that way (a group over 255, a prefix over 32, an 8 or 9 after a
+// leading zero), which would stall the poll loop. This is the shape an older agent could
+// have installed, and being digits and dots only it cannot pass for an option in the argv.
+func plainDottedV4(t string) bool {
+	if len(t) > 64 {
+		return false
+	}
+	host, prefix, cidr := strings.Cut(t, "/")
+	if cidr && !numberInBase0(prefix, 32) {
+		return false
+	}
+	parts := strings.Split(host, ".")
+	if len(parts) != 4 {
+		return false
+	}
+	for _, p := range parts {
+		if !numberInBase0(p, 255) {
+			return false
+		}
+	}
+	return true
+}
+
+// numberInBase0 reports whether s is one or more digits that read, in base 0, as a number
+// no larger than limit.
+func numberInBase0(s string, limit uint64) bool {
+	if s == "" || strings.Trim(s, "0123456789") != "" {
+		return false
+	}
+	n, err := strconv.ParseUint(s, 0, 8)
+	return err == nil && n <= limit
+}
+
 func iptablesArgs(op, target string) []string {
 	if op == "revert" {
 		return []string{"-D", "INPUT", "-s", target, "-j", "DROP"}
@@ -247,14 +283,24 @@ func runFirewall(op, target string, enforce bool, blockContainer string) execRes
 	// A block is judged by policy, a revert by syntax only: a revert just deletes the exact
 	// DROP rule, so a rule an older build installed for a target the policy now refuses
 	// must stay removable.
+	legacy := false
 	if op == "revert" {
 		if _, _, reason := parseIPTarget(target); reason != "" {
-			return execResult{"failed", map[string]any{"error": "invalid target: " + reason}}
+			// An older agent handed the target to iptables as it came, and iptables reads a leading
+			// zero as octal (/032 installed /26, 010.0.0.1 is 8.0.0.1). Delete with that exact
+			// spelling so the rule stays removable; a block never takes this path.
+			if !plainDottedV4(target) {
+				return execResult{"failed", map[string]any{"error": "invalid target: " + reason}}
+			}
+			legacy = true
 		}
 	} else if ok, reason := validIPTarget(target); !ok {
 		return execResult{"failed", map[string]any{"error": "invalid target: " + reason}}
 	}
 	bin, spelled := firewallFamily(target)
+	if legacy {
+		bin, spelled = "iptables", target
+	}
 	args := iptablesArgs(op, spelled)
 	if runtime.GOOS != "linux" {
 		return execResult{"done", map[string]any{"note": "recorded on a non-linux host, no firewall change", "op": op, "target": target}}
